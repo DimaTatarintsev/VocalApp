@@ -1,0 +1,215 @@
+import numpy as np
+import pyaudio
+import threading
+import tkinter as tk
+from collections import deque
+
+class PitchDetector:
+    def __init__(self):
+        # Настройки аудио
+        self.CHUNK = 2048
+        self.RATE = 44100
+        self.FORMAT = pyaudio.paInt16
+        self.CHANNELS = 1
+        
+        # Основные ноты (A0 до C8)
+        self.notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+        self.reference_A4 = 440.0  # эталонная нота A4
+        
+        self.audio = pyaudio.PyAudio()
+        self.stream = None
+        self.is_running = False
+        
+        # Для сглаживания результатов
+        self.pitch_history = deque(maxlen=5)
+        
+        self.setup_gui()
+        
+    def frequency_to_note(self, freq):
+        """Конвертирует частоту в ноту"""
+        if freq <= 0:
+            return "---", 0
+            
+        # Вычисляем количество полутонов от A4
+        n = 12 * np.log2(freq / self.reference_A4)
+        
+        # Округляем до ближайшего полутона
+        note_index = round(n)
+        
+        # Вычисляем октаву и индекс ноты
+        octave = 4 + (note_index + 9) // 12
+        note_number = (note_index + 9) % 12
+        
+        note_name = self.notes[note_number] + str(octave)
+        
+        # Вычисляем отклонение в центах
+        cents = 100 * (n - note_index)
+        
+        return note_name, cents
+        
+    def detect_pitch(self, data):
+        """Обнаруживает основную частоту с помощью автокорреляции"""
+        # Конвертируем в numpy array
+        data = np.frombuffer(data, dtype=np.int16)
+        
+        # Применяем оконную функцию
+        window = np.hanning(len(data))
+        data = data * window
+        
+        # Автокорреляция
+        correlation = np.correlate(data, data, mode='full')
+        correlation = correlation[len(correlation)//2:]
+        
+        # Находим пики (исключая первый)
+        peaks = []
+        for i in range(1, len(correlation)-1):
+            if correlation[i] > correlation[i-1] and correlation[i] > correlation[i+1]:
+                if correlation[i] > correlation[0] * 0.1:  # минимальный порог
+                    peaks.append(i)
+        
+        if not peaks:
+            return 0
+            
+        # Берем первый значительный пик как основную частоту
+        fundamental = peaks[0]
+        frequency = self.RATE / fundamental
+        
+        # Фильтруем нереальные частоты
+        if frequency < 50 or frequency > 2000:
+            return 0
+            
+        return frequency
+        
+    def audio_callback(self, in_data, frame_count, time_info, status):
+        """Callback функция для аудиопотока"""
+        if self.is_running:
+            freq = self.detect_pitch(in_data)
+            if freq > 0:
+                self.pitch_history.append(freq)
+                
+                # Используем медиану для сглаживания
+                if len(self.pitch_history) >= 3:
+                    smoothed_freq = np.median(list(self.pitch_history)[-3:])
+                    self.update_display(smoothed_freq)
+        
+        return (in_data, pyaudio.paContinue)
+        
+    def update_display(self, frequency):
+        """Обновляет GUI с новой информацией о частоте и ноте"""
+        note, cents = self.frequency_to_note(frequency)
+        
+        # Обновляем в основном потоке GUI
+        self.root.after(0, lambda: self._update_gui(frequency, note, cents))
+        
+    def _update_gui(self, frequency, note, cents):
+        """Внутренняя функция для обновления GUI"""
+        self.freq_label.config(text=f"Частота: {frequency:.1f} Hz")
+        self.note_label.config(text=f"Нота: {note}")
+        
+        # Показываем отклонение
+        if abs(cents) < 10:
+            color = "green"
+            tuning = "✓ В строю"
+        else:
+            color = "red"
+            direction = "↑" if cents > 0 else "↓"
+            tuning = f"{direction} {abs(cents):.1f} центов"
+            
+        self.tuning_label.config(text=tuning, fg=color)
+        
+    def setup_gui(self):
+        """Создает графический интерфейс"""
+        self.root = tk.Tk()
+        self.root.title("Детектор высоты тона")
+        self.root.geometry("300x200")
+        self.root.configure(bg='#f0f0f0')
+        
+        # Заголовок
+        title_label = tk.Label(self.root, text="Детектор высоты тона", 
+                              font=("Arial", 16, "bold"), bg='#f0f0f0')
+        title_label.pack(pady=10)
+        
+        # Метки для отображения информации
+        self.freq_label = tk.Label(self.root, text="Частота: --- Hz", 
+                                  font=("Arial", 14), bg='#f0f0f0')
+        self.freq_label.pack(pady=5)
+        
+        self.note_label = tk.Label(self.root, text="Но��а: ---", 
+                                  font=("Arial", 18, "bold"), bg='#f0f0f0')
+        self.note_label.pack(pady=5)
+        
+        self.tuning_label = tk.Label(self.root, text="", 
+                                    font=("Arial", 12), bg='#f0f0f0')
+        self.tuning_label.pack(pady=5)
+        
+        # Кнопка запуска/остановки
+        self.control_button = tk.Button(self.root, text="Запуск", 
+                                       command=self.toggle_detection,
+                                       font=("Arial", 12), bg='#4CAF50', fg='white')
+        self.control_button.pack(pady=10)
+        
+        # Инструкция
+        instruction = tk.Label(self.root, text="Нажмите 'Запуск' и начните играть ноту", 
+                              font=("Arial", 10), bg='#f0f0f0', fg='#666')
+        instruction.pack(pady=5)
+        
+    def toggle_detection(self):
+        """Запускает или останавливает обнаружение"""
+        if not self.is_running:
+            self.start_detection()
+            self.control_button.config(text="Стоп", bg='#f44336')
+        else:
+            self.stop_detection()
+            self.control_button.config(text="Запуск", bg='#4CAF50')
+            
+    def start_detection(self):
+        """Запускает аудиопоток"""
+        try:
+            self.stream = self.audio.open(
+                format=self.FORMAT,
+                channels=self.CHANNELS,
+                rate=self.RATE,
+                input=True,
+                frames_per_buffer=self.CHUNK,
+                stream_callback=self.audio_callback
+            )
+            self.stream.start_stream()
+            self.is_running = True
+        except Exception as e:
+            print(f"Ошибка запуска аудиопотока: {e}")
+            
+    def stop_detection(self):
+        """Останавливает аудиопоток"""
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        self.is_running = False
+        
+        # Сбрасываем отображение
+        self.freq_label.config(text="Частота: --- Hz")
+        self.note_label.config(text="Но��а: ---")
+        self.tuning_label.config(text="")
+        
+    def run(self):
+        """Запускает приложение"""
+        try:
+            self.root.mainloop()
+        finally:
+            if self.is_running:
+                self.stop_detection()
+            self.audio.terminate()
+
+if __name__ == "__main__":
+    print("Запуск детектора высоты тона...")
+    print("Убедитесь, что микрофон подключен и доступен.")
+    
+    # Проверяем наличие необходимых библиотек
+    try:
+        detector = PitchDetector()
+        detector.run()
+    except ImportError as e:
+        print(f"Ошибка: Не удалось импортировать необходимые библиотеки.")
+        print("Установите необходимые зависимости:")
+        print("pip install numpy pyaudio")
+    except Exception as e:
+        print(f"Ошибка при запуске: {e}")
